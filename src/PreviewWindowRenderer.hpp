@@ -70,6 +70,11 @@ private:
     void renderProcessedPreview(const PreviewFrameInfo &frame, const QSize &size);
     void renderDirectToWindow(const PreviewFrameInfo &frame, const QRectF &rect, float winH);
     void blitPreviewToWindow(const QRectF &rect, float winH);
+    bool uploadPlanarYuvTexture(const PreviewFrameInfo &frame,
+                                int sourceFd,
+                                unsigned int width,
+                                unsigned int height,
+                                unsigned int stride);
     bool uploadCpuFallbackTexture(const PreviewFrameInfo &frame,
                                   int sourceFd,
                                   unsigned int width,
@@ -110,6 +115,8 @@ private:
     GLuint m_passthroughProgram = 0;
     GLuint m_processProgram2D = 0;
     GLuint m_passthroughProgram2D = 0;
+    GLuint m_processProgramPlanar = 0;
+    GLuint m_passthroughProgramPlanar = 0;
     GLuint m_vbo = 0;
     GLint m_processPosLoc = -1;
     GLint m_processUvLoc = -1;
@@ -123,6 +130,16 @@ private:
     GLint m_passthrough2DPosLoc = -1;
     GLint m_passthrough2DUvLoc = -1;
     GLint m_passthrough2DTexLoc = -1;
+    GLint m_processPlanarPosLoc = -1;
+    GLint m_processPlanarUvLoc = -1;
+    GLint m_processPlanarYLoc = -1;
+    GLint m_processPlanarULoc = -1;
+    GLint m_processPlanarVLoc = -1;
+    GLint m_passthroughPlanarPosLoc = -1;
+    GLint m_passthroughPlanarUvLoc = -1;
+    GLint m_passthroughPlanarYLoc = -1;
+    GLint m_passthroughPlanarULoc = -1;
+    GLint m_passthroughPlanarVLoc = -1;
 
     // Zebra shader uniforms
     GLint m_uTimeLoc = -1;
@@ -131,6 +148,9 @@ private:
     GLint m_uTime2DLoc = -1;
     GLint m_uZebraEnabled2DLoc = -1;
     GLint m_uZebraThreshold2DLoc = -1;
+    GLint m_uTimePlanarLoc = -1;
+    GLint m_uZebraEnabledPlanarLoc = -1;
+    GLint m_uZebraThresholdPlanarLoc = -1;
 
     GLint m_focusPeakingEnabledLoc = -1;
     GLint m_focusPeakingThresholdLoc = -1;
@@ -138,27 +158,36 @@ private:
     GLint m_focusPeakingEnabled2DLoc = -1;
     GLint m_focusPeakingThreshold2DLoc = -1;
     GLint m_focusPeakingColor2DLoc = -1;
+    GLint m_focusPeakingEnabledPlanarLoc = -1;
+    GLint m_focusPeakingThresholdPlanarLoc = -1;
+    GLint m_focusPeakingColorPlanarLoc = -1;
 
     GLint m_grayscaleEnabledLoc = -1;
     GLint m_smpteEnabledLoc = -1;
     GLint m_grayscaleEnabled2DLoc = -1;
     GLint m_smpteEnabled2DLoc = -1;
+    GLint m_grayscaleEnabledPlanarLoc = -1;
+    GLint m_smpteEnabledPlanarLoc = -1;
 
     GLint m_falseColorEnabledLoc = -1;
     GLint m_falseColorModeLoc = -1;
     GLint m_falseColorEnabled2DLoc = -1;
     GLint m_falseColorMode2DLoc = -1;
+    GLint m_falseColorEnabledPlanarLoc = -1;
+    GLint m_falseColorModePlanarLoc = -1;
 
     QElapsedTimer m_shaderTimer;
 
     std::unordered_map<uint64_t, ImportedBuffer> m_importedBuffers;
     GLuint m_currentTexture = 0;
     GLenum m_currentTextureTarget = GL_TEXTURE_EXTERNAL_OES;
+    GLuint m_planarTextures[3] = { 0, 0, 0 };
     GLuint m_cpuFallbackTexture = 0;
     GLuint m_previewTexture = 0;
     GLuint m_previewFbo = 0;
     QSize m_previewSize;
     QSize m_cpuFallbackTextureSize;
+    QSize m_planarTextureSizes[3];
     std::vector<unsigned char> m_cpuRgbaBuffer;
     int m_importedProcId = -1;
     unsigned int m_importedWidth = 0;
@@ -177,7 +206,10 @@ private:
     std::optional<PreviewFrameInfo> m_lastRenderableFrame;
     bool m_updatePending = false;
     bool m_directWindowRendering = false;
+    bool m_forcePlanarFallback = false;
     bool m_forceCpuFallback = false;
+    bool m_currentTextureIsPlanar = false;
+    bool m_loggedPlanarFallback = false;
     bool m_loggedCpuFallback = false;
     bool m_loggedCpuFallbackFailure = false;
     bool m_loggedShaderPrograms = false;

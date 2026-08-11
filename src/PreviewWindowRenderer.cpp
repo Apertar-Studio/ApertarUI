@@ -8,6 +8,7 @@
 #include <QMatrix4x4>
 #include <QDebug>
 #include <QFile>
+#include <QIODevice>
 #include <QOpenGLContext>
 #include <QOpenGLExtraFunctions>
 
@@ -22,17 +23,108 @@
 #include <cmath>
 #include <string>
 
+namespace {
+
+bool runningOnRaspberryPi3()
+{
+    QFile modelFile(QStringLiteral("/proc/device-tree/model"));
+    if (!modelFile.open(QIODevice::ReadOnly))
+        return false;
+
+    const QByteArray model = modelFile.readAll().toLower();
+    return model.contains("raspberry pi 3");
+}
+
+bool envFlagEnabled(const char *name)
+{
+    const QByteArray value = qgetenv(name).toLower();
+    return !value.isEmpty() &&
+           value != "0" &&
+           value != "false" &&
+           value != "off";
+}
+
+void uploadLumaPlane(GLuint *texture,
+                     QSize *storedSize,
+                     const unsigned char *data,
+                     unsigned int width,
+                     unsigned int height,
+                     unsigned int pitch)
+{
+    if (!texture || !storedSize || !data || width == 0 || height == 0 || pitch == 0)
+        return;
+
+    if (!*texture)
+        glGenTextures(1, texture);
+
+    const QSize size{int(width), int(height)};
+    glBindTexture(GL_TEXTURE_2D, *texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    GLint previousAlignment = 4;
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &previousAlignment);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+    if (*storedSize != size) {
+        glTexImage2D(GL_TEXTURE_2D,
+                     0,
+                     GL_LUMINANCE,
+                     int(width),
+                     int(height),
+                     0,
+                     GL_LUMINANCE,
+                     GL_UNSIGNED_BYTE,
+                     nullptr);
+        *storedSize = size;
+    }
+
+    if (pitch == width) {
+        glTexSubImage2D(GL_TEXTURE_2D,
+                        0,
+                        0,
+                        0,
+                        int(width),
+                        int(height),
+                        GL_LUMINANCE,
+                        GL_UNSIGNED_BYTE,
+                        data);
+    } else {
+        for (unsigned int row = 0; row < height; ++row) {
+            glTexSubImage2D(GL_TEXTURE_2D,
+                            0,
+                            0,
+                            int(row),
+                            int(width),
+                            1,
+                            GL_LUMINANCE,
+                            GL_UNSIGNED_BYTE,
+                            data + size_t(row) * pitch);
+        }
+    }
+
+    glPixelStorei(GL_UNPACK_ALIGNMENT, previousAlignment);
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+} // namespace
+
 PreviewWindowRenderer::PreviewWindowRenderer(QObject *parent)
     : QObject(parent)
 {
-    const QByteArray forceCpuValue = qgetenv("APERTAR_PREVIEW_FORCE_CPU").toLower();
-    m_forceCpuFallback =
-        !forceCpuValue.isEmpty() &&
-        forceCpuValue != "0" &&
-        forceCpuValue != "false" &&
-        forceCpuValue != "off";
+    const bool pi3 = runningOnRaspberryPi3();
+    m_forceCpuFallback = envFlagEnabled("APERTAR_PREVIEW_FORCE_CPU");
     if (m_forceCpuFallback)
         qInfo() << "Apertar preview: using CPU texture preview fallback because APERTAR_PREVIEW_FORCE_CPU is set.";
+
+    m_forcePlanarFallback = envFlagEnabled("APERTAR_PREVIEW_FORCE_PLANAR") ||
+                            (pi3 && !envFlagEnabled("APERTAR_PREVIEW_FORCE_EGL"));
+    if (pi3)
+        m_directWindowRendering = true;
+    if (m_forcePlanarFallback && !m_forceCpuFallback)
+        qInfo() << "Apertar preview: using planar YUV texture path for Pi3/VC4 compatibility.";
 
     m_shaderTimer.start();
 }
@@ -48,6 +140,12 @@ PreviewWindowRenderer::~PreviewWindowRenderer()
         glDeleteProgram(m_processProgram2D);
     if (m_passthroughProgram2D)
         glDeleteProgram(m_passthroughProgram2D);
+    if (m_processProgramPlanar)
+        glDeleteProgram(m_processProgramPlanar);
+    if (m_passthroughProgramPlanar)
+        glDeleteProgram(m_passthroughProgramPlanar);
+    if (m_planarTextures[0] || m_planarTextures[1] || m_planarTextures[2])
+        glDeleteTextures(3, m_planarTextures);
     if (m_cpuFallbackTexture)
         glDeleteTextures(1, &m_cpuFallbackTexture);
     if (m_previewTexture)
@@ -228,12 +326,13 @@ void PreviewWindowRenderer::initializePipeline()
         }
     )";
 
-    static const char *fsCommon = R"(
+    static const char *fsPreamble = R"(
     precision mediump float;
 
     varying vec2 vUv;
-    uniform SOURCE_SAMPLER uTex;
+)";
 
+    static const char *fsCommon = R"(
     uniform float uTime;
 
     uniform int uZebraEnabled;
@@ -346,9 +445,9 @@ void PreviewWindowRenderer::initializePipeline()
     float edgeStrength(vec2 uv) {
         vec2 texel = vec2(1.0 / 1920.0, 1.0 / 1080.0);
 
-        float c = luminance(texture2D(uTex, uv).rgb);
-        float r = luminance(texture2D(uTex, uv + vec2(texel.x, 0.0)).rgb);
-        float b = luminance(texture2D(uTex, uv + vec2(0.0, texel.y)).rgb);
+        float c = luminance(sourceColor(uv).rgb);
+        float r = luminance(sourceColor(uv + vec2(texel.x, 0.0)).rgb);
+        float b = luminance(sourceColor(uv + vec2(0.0, texel.y)).rgb);
 
         return abs(r - c) + abs(b - c);
     }
@@ -357,7 +456,7 @@ void PreviewWindowRenderer::initializePipeline()
     void main() {
         vec4 src = uSmpteEnabled == 1
             ? vec4(smpteColorBars(vUv), 1.0)
-            : texture2D(uTex, vUv);
+            : sourceColor(vUv);
         float luma = luminance(src.rgb);
 
         vec4 outColor = src;
@@ -396,26 +495,65 @@ void PreviewWindowRenderer::initializePipeline()
 )";
 
     static const char *passthroughFsCommon = R"(
-    precision mediump float;
-
-    varying vec2 vUv;
-    uniform SOURCE_SAMPLER uTex;
-
     void main() {
-        gl_FragColor = texture2D(uTex, vUv);
+        gl_FragColor = sourceColor(vUv);
+    }
+)";
+
+    static const char *externalSourceCommon = R"(
+    uniform SOURCE_SAMPLER uTex;
+    vec4 sourceColor(vec2 uv) {
+        return texture2D(uTex, uv);
+    }
+)";
+
+    static const char *planarSourceCommon = R"(
+    uniform sampler2D uTexY;
+    uniform sampler2D uTexU;
+    uniform sampler2D uTexV;
+
+    vec4 sourceColor(vec2 uv) {
+        float y = max(0.0, texture2D(uTexY, uv).r - 0.0625);
+        float u = texture2D(uTexU, uv).r - 0.5;
+        float v = texture2D(uTexV, uv).r - 0.5;
+        vec3 rgb;
+        rgb.r = 1.164383 * y + 1.792741 * v;
+        rgb.g = 1.164383 * y - 0.213249 * u - 0.532909 * v;
+        rgb.b = 1.164383 * y + 2.112402 * u;
+        return vec4(clamp(rgb, 0.0, 1.0), 1.0);
     }
 )";
 
     const std::string externalFs =
         "#extension GL_OES_EGL_image_external : require\n"
-        "#define SOURCE_SAMPLER samplerExternalOES\n" + std::string(fsCommon);
+        "#define SOURCE_SAMPLER samplerExternalOES\n" +
+        std::string(fsPreamble) +
+        std::string(externalSourceCommon) +
+        std::string(fsCommon);
     const std::string texture2DFs =
-        "#define SOURCE_SAMPLER sampler2D\n" + std::string(fsCommon);
+        "#define SOURCE_SAMPLER sampler2D\n" +
+        std::string(fsPreamble) +
+        std::string(externalSourceCommon) +
+        std::string(fsCommon);
+    const std::string planarFs =
+        std::string(fsPreamble) +
+        std::string(planarSourceCommon) +
+        std::string(fsCommon);
     const std::string externalPassthroughFs =
         "#extension GL_OES_EGL_image_external : require\n"
-        "#define SOURCE_SAMPLER samplerExternalOES\n" + std::string(passthroughFsCommon);
+        "#define SOURCE_SAMPLER samplerExternalOES\n" +
+        std::string(fsPreamble) +
+        std::string(externalSourceCommon) +
+        std::string(passthroughFsCommon);
     const std::string texture2DPassthroughFs =
-        "#define SOURCE_SAMPLER sampler2D\n" + std::string(passthroughFsCommon);
+        "#define SOURCE_SAMPLER sampler2D\n" +
+        std::string(fsPreamble) +
+        std::string(externalSourceCommon) +
+        std::string(passthroughFsCommon);
+    const std::string planarPassthroughFs =
+        std::string(fsPreamble) +
+        std::string(planarSourceCommon) +
+        std::string(passthroughFsCommon);
 
     GLuint vert = compileShader(GL_VERTEX_SHADER, vs);
     GLuint frag = compileShader(GL_FRAGMENT_SHADER, externalFs.c_str());
@@ -510,6 +648,52 @@ void PreviewWindowRenderer::initializePipeline()
     if (passthroughFrag2D)
         glDeleteShader(passthroughFrag2D);
 
+    GLuint vertPlanar = compileShader(GL_VERTEX_SHADER, vs);
+    GLuint fragPlanar = compileShader(GL_FRAGMENT_SHADER, planarFs.c_str());
+    if (vertPlanar && fragPlanar) {
+        m_processProgramPlanar = glCreateProgram();
+        glAttachShader(m_processProgramPlanar, vertPlanar);
+        glAttachShader(m_processProgramPlanar, fragPlanar);
+        glLinkProgram(m_processProgramPlanar);
+
+        ok = 0;
+        glGetProgramiv(m_processProgramPlanar, GL_LINK_STATUS, &ok);
+        if (!ok) {
+            char log[1024]{};
+            glGetProgramInfoLog(m_processProgramPlanar, sizeof(log), nullptr, log);
+            qWarning() << "Planar process program link failed:" << log;
+            glDeleteProgram(m_processProgramPlanar);
+            m_processProgramPlanar = 0;
+        }
+    }
+    if (vertPlanar)
+        glDeleteShader(vertPlanar);
+    if (fragPlanar)
+        glDeleteShader(fragPlanar);
+
+    GLuint passthroughVertPlanar = compileShader(GL_VERTEX_SHADER, vs);
+    GLuint passthroughFragPlanar = compileShader(GL_FRAGMENT_SHADER, planarPassthroughFs.c_str());
+    if (passthroughVertPlanar && passthroughFragPlanar) {
+        m_passthroughProgramPlanar = glCreateProgram();
+        glAttachShader(m_passthroughProgramPlanar, passthroughVertPlanar);
+        glAttachShader(m_passthroughProgramPlanar, passthroughFragPlanar);
+        glLinkProgram(m_passthroughProgramPlanar);
+
+        ok = 0;
+        glGetProgramiv(m_passthroughProgramPlanar, GL_LINK_STATUS, &ok);
+        if (!ok) {
+            char log[1024]{};
+            glGetProgramInfoLog(m_passthroughProgramPlanar, sizeof(log), nullptr, log);
+            qWarning() << "Planar passthrough program link failed:" << log;
+            glDeleteProgram(m_passthroughProgramPlanar);
+            m_passthroughProgramPlanar = 0;
+        }
+    }
+    if (passthroughVertPlanar)
+        glDeleteShader(passthroughVertPlanar);
+    if (passthroughFragPlanar)
+        glDeleteShader(passthroughFragPlanar);
+
     if (m_processProgram) {
         m_processPosLoc = glGetAttribLocation(m_processProgram, "aPos");
         m_processUvLoc = glGetAttribLocation(m_processProgram, "aUv");
@@ -562,10 +746,41 @@ void PreviewWindowRenderer::initializePipeline()
         m_passthrough2DTexLoc = glGetUniformLocation(m_passthroughProgram2D, "uTex");
     }
 
+    if (m_processProgramPlanar) {
+        m_processPlanarPosLoc = glGetAttribLocation(m_processProgramPlanar, "aPos");
+        m_processPlanarUvLoc = glGetAttribLocation(m_processProgramPlanar, "aUv");
+        m_processPlanarYLoc = glGetUniformLocation(m_processProgramPlanar, "uTexY");
+        m_processPlanarULoc = glGetUniformLocation(m_processProgramPlanar, "uTexU");
+        m_processPlanarVLoc = glGetUniformLocation(m_processProgramPlanar, "uTexV");
+
+        m_uTimePlanarLoc = glGetUniformLocation(m_processProgramPlanar, "uTime");
+        m_uZebraEnabledPlanarLoc = glGetUniformLocation(m_processProgramPlanar, "uZebraEnabled");
+        m_uZebraThresholdPlanarLoc = glGetUniformLocation(m_processProgramPlanar, "uZebraThreshold");
+
+        m_focusPeakingEnabledPlanarLoc = glGetUniformLocation(m_processProgramPlanar, "uFocusPeakingEnabled");
+        m_focusPeakingThresholdPlanarLoc = glGetUniformLocation(m_processProgramPlanar, "uFocusPeakingThreshold");
+        m_focusPeakingColorPlanarLoc = glGetUniformLocation(m_processProgramPlanar, "uFocusPeakingColor");
+
+        m_grayscaleEnabledPlanarLoc = glGetUniformLocation(m_processProgramPlanar, "uGrayscaleEnabled");
+        m_smpteEnabledPlanarLoc = glGetUniformLocation(m_processProgramPlanar, "uSmpteEnabled");
+
+        m_falseColorEnabledPlanarLoc = glGetUniformLocation(m_processProgramPlanar, "uFalseColorEnabled");
+        m_falseColorModePlanarLoc = glGetUniformLocation(m_processProgramPlanar, "uFalseColorMode");
+    }
+
+    if (m_passthroughProgramPlanar) {
+        m_passthroughPlanarPosLoc = glGetAttribLocation(m_passthroughProgramPlanar, "aPos");
+        m_passthroughPlanarUvLoc = glGetAttribLocation(m_passthroughProgramPlanar, "aUv");
+        m_passthroughPlanarYLoc = glGetUniformLocation(m_passthroughProgramPlanar, "uTexY");
+        m_passthroughPlanarULoc = glGetUniformLocation(m_passthroughProgramPlanar, "uTexU");
+        m_passthroughPlanarVLoc = glGetUniformLocation(m_passthroughProgramPlanar, "uTexV");
+    }
+
     if (!m_loggedShaderPrograms) {
         qInfo() << "Apertar preview shaders:"
                 << "external" << bool(m_processProgram || m_passthroughProgram)
-                << "texture2D" << bool(m_processProgram2D || m_passthroughProgram2D);
+                << "texture2D" << bool(m_processProgram2D || m_passthroughProgram2D)
+                << "planarYuv" << bool(m_processProgramPlanar || m_passthroughProgramPlanar);
         m_loggedShaderPrograms = true;
     }
 
@@ -641,6 +856,124 @@ void PreviewWindowRenderer::cleanupImportedBuffers()
     m_lastImportedSequence = 0;
     m_haveImportedSequence = false;
     m_lastRenderableFrame.reset();
+    m_currentTextureIsPlanar = false;
+}
+
+bool PreviewWindowRenderer::uploadPlanarYuvTexture(const PreviewFrameInfo &frame,
+                                                   int sourceFd,
+                                                   unsigned int width,
+                                                   unsigned int height,
+                                                   unsigned int stride)
+{
+    if (sourceFd < 0 || width == 0 || height == 0 || stride == 0 ||
+        (!m_processProgramPlanar && !m_passthroughProgramPlanar)) {
+        return false;
+    }
+
+    const bool hasExplicitPlanes =
+        frame.planeCount >= 3 &&
+        frame.planePitches[0] > 0 &&
+        frame.planePitches[1] > 0 &&
+        frame.planePitches[2] > 0;
+
+    const bool hasPlaneFds = hasExplicitPlanes &&
+        frame.planeFds[0] >= 0 &&
+        frame.planeFds[1] >= 0 &&
+        frame.planeFds[2] >= 0;
+
+    const unsigned int yOffset = hasExplicitPlanes ? frame.planeOffsets[0] : 0;
+    const unsigned int uOffset = hasExplicitPlanes ? frame.planeOffsets[1] : stride * height;
+    const unsigned int vOffset = hasExplicitPlanes
+        ? frame.planeOffsets[2]
+        : stride * height + (std::max(1u, stride / 2u) * ((height + 1u) / 2u));
+    const unsigned int yPitch = hasExplicitPlanes ? frame.planePitches[0] : stride;
+    const unsigned int uPitch = hasExplicitPlanes ? frame.planePitches[1] : std::max(1u, stride / 2u);
+    const unsigned int vPitch = hasExplicitPlanes ? frame.planePitches[2] : uPitch;
+    const unsigned int chromaWidth = (width + 1u) / 2u;
+    const unsigned int chromaHeight = (height + 1u) / 2u;
+
+    const size_t yEnd = size_t(yOffset) + size_t(yPitch) * size_t(height);
+    const size_t uEnd = size_t(uOffset) + size_t(uPitch) * size_t(chromaHeight);
+    const size_t vEnd = size_t(vOffset) + size_t(vPitch) * size_t(chromaHeight);
+    size_t mapBytes = std::max(yEnd, uEnd);
+    mapBytes = std::max(mapBytes, vEnd);
+    if (mapBytes == 0)
+        return false;
+
+    const int yFd = hasPlaneFds ? frame.planeFds[0] : sourceFd;
+    const int uFd = hasPlaneFds ? frame.planeFds[1] : sourceFd;
+    const int vFd = hasPlaneFds ? frame.planeFds[2] : sourceFd;
+
+    const size_t yMapBytes = (hasPlaneFds && (uFd != yFd || vFd != yFd)) ? yEnd : mapBytes;
+    void *mappedY = ::mmap(nullptr, yMapBytes, PROT_READ, MAP_SHARED, yFd, 0);
+    if (mappedY == MAP_FAILED)
+        return false;
+
+    void *mappedU = mappedY;
+    void *mappedV = mappedY;
+    size_t uMapBytes = yMapBytes;
+    size_t vMapBytes = yMapBytes;
+
+    if (hasPlaneFds && uFd != yFd) {
+        uMapBytes = uEnd;
+        mappedU = ::mmap(nullptr, uMapBytes, PROT_READ, MAP_SHARED, uFd, 0);
+        if (mappedU == MAP_FAILED) {
+            ::munmap(mappedY, yMapBytes);
+            return false;
+        }
+    }
+
+    if (hasPlaneFds && vFd != yFd && vFd != uFd) {
+        vMapBytes = vEnd;
+        mappedV = ::mmap(nullptr, vMapBytes, PROT_READ, MAP_SHARED, vFd, 0);
+        if (mappedV == MAP_FAILED) {
+            if (mappedU != mappedY)
+                ::munmap(mappedU, uMapBytes);
+            ::munmap(mappedY, yMapBytes);
+            return false;
+        }
+    } else if (hasPlaneFds && vFd == uFd) {
+        mappedV = mappedU;
+        vMapBytes = uMapBytes;
+    }
+
+    const auto *yBase = static_cast<const unsigned char *>(mappedY);
+    const auto *uBase = static_cast<const unsigned char *>(mappedU);
+    const auto *vBase = static_cast<const unsigned char *>(mappedV);
+    const unsigned char *yPlane = yBase + yOffset;
+    const unsigned char *uPlane = uBase + uOffset;
+    const unsigned char *vPlane = vBase + vOffset;
+
+    uploadLumaPlane(&m_planarTextures[0], &m_planarTextureSizes[0], yPlane, width, height, yPitch);
+    uploadLumaPlane(&m_planarTextures[1], &m_planarTextureSizes[1], uPlane, chromaWidth, chromaHeight, uPitch);
+    uploadLumaPlane(&m_planarTextures[2], &m_planarTextureSizes[2], vPlane, chromaWidth, chromaHeight, vPitch);
+
+    if (mappedV != mappedY && mappedV != mappedU)
+        ::munmap(mappedV, vMapBytes);
+    if (mappedU != mappedY)
+        ::munmap(mappedU, uMapBytes);
+    ::munmap(mappedY, yMapBytes);
+
+    if (!m_planarTextures[0] || !m_planarTextures[1] || !m_planarTextures[2])
+        return false;
+
+    if (!m_loggedPlanarFallback) {
+        qWarning() << "Apertar preview using planar YUV texture path for"
+                   << width << "x" << height
+                   << "stride" << stride;
+        m_loggedPlanarFallback = true;
+    }
+
+    m_currentTexture = m_planarTextures[0];
+    m_currentTextureTarget = GL_TEXTURE_2D;
+    m_currentTextureIsPlanar = true;
+    m_importedProcId = frame.procid;
+    m_importedWidth = width;
+    m_importedHeight = height;
+    m_importedStride = stride;
+    m_importedCaptureWidth = frame.captureWidth;
+    m_importedCaptureHeight = frame.captureHeight;
+    return true;
 }
 
 bool PreviewWindowRenderer::uploadCpuFallbackTexture(const PreviewFrameInfo &frame,
@@ -688,7 +1021,7 @@ bool PreviewWindowRenderer::uploadCpuFallbackTexture(const PreviewFrameInfo &fra
     const int uFd = hasPlaneFds ? frame.planeFds[1] : sourceFd;
     const int vFd = hasPlaneFds ? frame.planeFds[2] : sourceFd;
 
-    const size_t yMapBytes = hasPlaneFds ? yEnd : mapBytes;
+    const size_t yMapBytes = (hasPlaneFds && (uFd != yFd || vFd != yFd)) ? yEnd : mapBytes;
     void *mapped = ::mmap(nullptr, yMapBytes, PROT_READ, MAP_SHARED, yFd, 0);
     void *mappedU = MAP_FAILED;
     void *mappedV = MAP_FAILED;
@@ -803,6 +1136,7 @@ bool PreviewWindowRenderer::uploadCpuFallbackTexture(const PreviewFrameInfo &fra
 
     m_currentTexture = m_cpuFallbackTexture;
     m_currentTextureTarget = GL_TEXTURE_2D;
+    m_currentTextureIsPlanar = false;
     m_importedProcId = frame.procid;
     m_importedWidth = width;
     m_importedHeight = height;
@@ -858,8 +1192,12 @@ void PreviewWindowRenderer::ensureImported(const PreviewFrameInfo &frame)
         if (m_forceCpuFallback)
             return uploadCpuFallbackTexture(frame, sourceFd, width, height, stride);
 
+        if (m_forcePlanarFallback)
+            return uploadPlanarYuvTexture(frame, sourceFd, width, height, stride);
+
         if (!m_processProgram && !m_passthroughProgram)
-            return uploadCpuFallbackTexture(frame, sourceFd, width, height, stride);
+            return uploadPlanarYuvTexture(frame, sourceFd, width, height, stride) ||
+                   uploadCpuFallbackTexture(frame, sourceFd, width, height, stride);
 
         const uint64_t frameBufferKey = dmaBufferKeyForFd(sourceFd);
         if (frameBufferKey == 0)
@@ -1012,6 +1350,7 @@ void PreviewWindowRenderer::ensureImported(const PreviewFrameInfo &frame)
         m_importedBuffers.emplace(frameBufferKey, imported);
         m_currentTexture = texture;
         m_currentTextureTarget = GL_TEXTURE_EXTERNAL_OES;
+        m_currentTextureIsPlanar = false;
         m_importedProcId = frame.procid;
         m_importedWidth = width;
         m_importedHeight = height;
@@ -1216,9 +1555,10 @@ void PreviewWindowRenderer::renderProcessedPreview(const PreviewFrameInfo &frame
                                  || state.grayscaleEnabled
                                  || state.smpteEnabled
                                  || state.falseColorEnabled;
-    const bool cpuTexture = m_currentTextureTarget == GL_TEXTURE_2D;
-    const GLuint processProgram = cpuTexture ? m_processProgram2D : m_processProgram;
-    const GLuint passthroughProgram = cpuTexture ? m_passthroughProgram2D : m_passthroughProgram;
+    const bool planarTexture = m_currentTextureIsPlanar;
+    const bool cpuTexture = m_currentTextureTarget == GL_TEXTURE_2D && !planarTexture;
+    const GLuint processProgram = planarTexture ? m_processProgramPlanar : (cpuTexture ? m_processProgram2D : m_processProgram);
+    const GLuint passthroughProgram = planarTexture ? m_passthroughProgramPlanar : (cpuTexture ? m_passthroughProgram2D : m_passthroughProgram);
 
     const bool usePassthrough = !needsProcessing && passthroughProgram;
     const GLuint activeProgram = usePassthrough ? passthroughProgram : processProgram;
@@ -1227,14 +1567,17 @@ void PreviewWindowRenderer::renderProcessedPreview(const PreviewFrameInfo &frame
         return;
     }
     const GLint activePosLoc = usePassthrough
-        ? (cpuTexture ? m_passthrough2DPosLoc : m_passthroughPosLoc)
-        : (cpuTexture ? m_process2DPosLoc : m_processPosLoc);
+        ? (planarTexture ? m_passthroughPlanarPosLoc : (cpuTexture ? m_passthrough2DPosLoc : m_passthroughPosLoc))
+        : (planarTexture ? m_processPlanarPosLoc : (cpuTexture ? m_process2DPosLoc : m_processPosLoc));
     const GLint activeUvLoc = usePassthrough
-        ? (cpuTexture ? m_passthrough2DUvLoc : m_passthroughUvLoc)
-        : (cpuTexture ? m_process2DUvLoc : m_processUvLoc);
+        ? (planarTexture ? m_passthroughPlanarUvLoc : (cpuTexture ? m_passthrough2DUvLoc : m_passthroughUvLoc))
+        : (planarTexture ? m_processPlanarUvLoc : (cpuTexture ? m_process2DUvLoc : m_processUvLoc));
     const GLint activeTexLoc = usePassthrough
         ? (cpuTexture ? m_passthrough2DTexLoc : m_passthroughTexLoc)
         : (cpuTexture ? m_process2DTexLoc : m_processTexLoc);
+    const GLint activeYLoc = usePassthrough ? m_passthroughPlanarYLoc : m_processPlanarYLoc;
+    const GLint activeULoc = usePassthrough ? m_passthroughPlanarULoc : m_processPlanarULoc;
+    const GLint activeVLoc = usePassthrough ? m_passthroughPlanarVLoc : m_processPlanarVLoc;
 
     glUseProgram(activeProgram);
     glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
@@ -1245,21 +1588,33 @@ void PreviewWindowRenderer::renderProcessedPreview(const PreviewFrameInfo &frame
     glVertexAttribPointer(activePosLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), reinterpret_cast<void *>(0));
     glVertexAttribPointer(activeUvLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), reinterpret_cast<void *>(2 * sizeof(GLfloat)));
 
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(m_currentTextureTarget, m_currentTexture);
-    glUniform1i(activeTexLoc, 0);
+    if (planarTexture) {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, m_planarTextures[0]);
+        glUniform1i(activeYLoc, 0);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, m_planarTextures[1]);
+        glUniform1i(activeULoc, 1);
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, m_planarTextures[2]);
+        glUniform1i(activeVLoc, 2);
+    } else {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(m_currentTextureTarget, m_currentTexture);
+        glUniform1i(activeTexLoc, 0);
+    }
 
     if (!usePassthrough) {
         const float timeSeconds = float(m_shaderTimer.elapsed()) / 1000.0f;
-        glUniform1f(cpuTexture ? m_uTime2DLoc : m_uTimeLoc, timeSeconds);
-        glUniform1i(cpuTexture ? m_uZebraEnabled2DLoc : m_uZebraEnabledLoc, state.zebraEnabled ? 1 : 0);
-        glUniform1f(cpuTexture ? m_uZebraThreshold2DLoc : m_uZebraThresholdLoc, state.zebraThreshold);
-        glUniform1i(cpuTexture ? m_focusPeakingEnabled2DLoc : m_focusPeakingEnabledLoc, state.focusPeakingEnabled ? 1 : 0);
-        glUniform1f(cpuTexture ? m_focusPeakingThreshold2DLoc : m_focusPeakingThresholdLoc, state.focusPeakingThreshold);
-        glUniform1i(cpuTexture ? m_grayscaleEnabled2DLoc : m_grayscaleEnabledLoc, state.grayscaleEnabled ? 1 : 0);
-        glUniform1i(cpuTexture ? m_smpteEnabled2DLoc : m_smpteEnabledLoc, state.smpteEnabled ? 1 : 0);
-        glUniform1i(cpuTexture ? m_falseColorEnabled2DLoc : m_falseColorEnabledLoc, state.falseColorEnabled ? 1 : 0);
-        glUniform1i(cpuTexture ? m_falseColorMode2DLoc : m_falseColorModeLoc, state.falseColorMode);
+        glUniform1f(planarTexture ? m_uTimePlanarLoc : (cpuTexture ? m_uTime2DLoc : m_uTimeLoc), timeSeconds);
+        glUniform1i(planarTexture ? m_uZebraEnabledPlanarLoc : (cpuTexture ? m_uZebraEnabled2DLoc : m_uZebraEnabledLoc), state.zebraEnabled ? 1 : 0);
+        glUniform1f(planarTexture ? m_uZebraThresholdPlanarLoc : (cpuTexture ? m_uZebraThreshold2DLoc : m_uZebraThresholdLoc), state.zebraThreshold);
+        glUniform1i(planarTexture ? m_focusPeakingEnabledPlanarLoc : (cpuTexture ? m_focusPeakingEnabled2DLoc : m_focusPeakingEnabledLoc), state.focusPeakingEnabled ? 1 : 0);
+        glUniform1f(planarTexture ? m_focusPeakingThresholdPlanarLoc : (cpuTexture ? m_focusPeakingThreshold2DLoc : m_focusPeakingThresholdLoc), state.focusPeakingThreshold);
+        glUniform1i(planarTexture ? m_grayscaleEnabledPlanarLoc : (cpuTexture ? m_grayscaleEnabled2DLoc : m_grayscaleEnabledLoc), state.grayscaleEnabled ? 1 : 0);
+        glUniform1i(planarTexture ? m_smpteEnabledPlanarLoc : (cpuTexture ? m_smpteEnabled2DLoc : m_smpteEnabledLoc), state.smpteEnabled ? 1 : 0);
+        glUniform1i(planarTexture ? m_falseColorEnabledPlanarLoc : (cpuTexture ? m_falseColorEnabled2DLoc : m_falseColorEnabledLoc), state.falseColorEnabled ? 1 : 0);
+        glUniform1i(planarTexture ? m_falseColorModePlanarLoc : (cpuTexture ? m_falseColorMode2DLoc : m_falseColorModeLoc), state.falseColorMode);
 
         QVector3D peakColor(1.0f, 0.1f, 0.1f);
         if (state.focusPeakingColor == "Green")
@@ -1270,7 +1625,7 @@ void PreviewWindowRenderer::renderProcessedPreview(const PreviewFrameInfo &frame
             peakColor = QVector3D(1.0f, 1.0f, 0.1f);
         else if (state.focusPeakingColor == "Pink")
             peakColor = QVector3D(1.0f, 0.2f, 0.7f);
-        glUniform3f(cpuTexture ? m_focusPeakingColor2DLoc : m_focusPeakingColorLoc,
+        glUniform3f(planarTexture ? m_focusPeakingColorPlanarLoc : (cpuTexture ? m_focusPeakingColor2DLoc : m_focusPeakingColorLoc),
                     peakColor.x(),
                     peakColor.y(),
                     peakColor.z());
@@ -1278,7 +1633,16 @@ void PreviewWindowRenderer::renderProcessedPreview(const PreviewFrameInfo &frame
 
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
-    glBindTexture(m_currentTextureTarget, 0);
+    if (planarTexture) {
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    } else {
+        glBindTexture(m_currentTextureTarget, 0);
+    }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     if (QOpenGLContext *context = QOpenGLContext::currentContext()) {
         if (QOpenGLExtraFunctions *extra = context->extraFunctions())
@@ -1318,9 +1682,10 @@ void PreviewWindowRenderer::blitPreviewToWindow(const QRectF &rect, float winH)
 
 void PreviewWindowRenderer::renderDirectToWindow(const PreviewFrameInfo &frame, const QRectF &rect, float winH)
 {
-    const bool cpuTexture = m_currentTextureTarget == GL_TEXTURE_2D;
-    const GLuint processProgram = cpuTexture ? m_processProgram2D : m_processProgram;
-    const GLuint passthroughProgram = cpuTexture ? m_passthroughProgram2D : m_passthroughProgram;
+    const bool planarTexture = m_currentTextureIsPlanar;
+    const bool cpuTexture = m_currentTextureTarget == GL_TEXTURE_2D && !planarTexture;
+    const GLuint processProgram = planarTexture ? m_processProgramPlanar : (cpuTexture ? m_processProgram2D : m_processProgram);
+    const GLuint passthroughProgram = planarTexture ? m_passthroughProgramPlanar : (cpuTexture ? m_passthroughProgram2D : m_passthroughProgram);
     if (!m_currentTexture || !m_window)
         return;
 
@@ -1410,14 +1775,17 @@ void PreviewWindowRenderer::renderDirectToWindow(const PreviewFrameInfo &frame, 
     if (!activeProgram)
         return;
     const GLint activePosLoc = usePassthrough
-        ? (cpuTexture ? m_passthrough2DPosLoc : m_passthroughPosLoc)
-        : (cpuTexture ? m_process2DPosLoc : m_processPosLoc);
+        ? (planarTexture ? m_passthroughPlanarPosLoc : (cpuTexture ? m_passthrough2DPosLoc : m_passthroughPosLoc))
+        : (planarTexture ? m_processPlanarPosLoc : (cpuTexture ? m_process2DPosLoc : m_processPosLoc));
     const GLint activeUvLoc = usePassthrough
-        ? (cpuTexture ? m_passthrough2DUvLoc : m_passthroughUvLoc)
-        : (cpuTexture ? m_process2DUvLoc : m_processUvLoc);
+        ? (planarTexture ? m_passthroughPlanarUvLoc : (cpuTexture ? m_passthrough2DUvLoc : m_passthroughUvLoc))
+        : (planarTexture ? m_processPlanarUvLoc : (cpuTexture ? m_process2DUvLoc : m_processUvLoc));
     const GLint activeTexLoc = usePassthrough
         ? (cpuTexture ? m_passthrough2DTexLoc : m_passthroughTexLoc)
         : (cpuTexture ? m_process2DTexLoc : m_processTexLoc);
+    const GLint activeYLoc = usePassthrough ? m_passthroughPlanarYLoc : m_processPlanarYLoc;
+    const GLint activeULoc = usePassthrough ? m_passthroughPlanarULoc : m_processPlanarULoc;
+    const GLint activeVLoc = usePassthrough ? m_passthroughPlanarVLoc : m_processPlanarVLoc;
 
     glUseProgram(activeProgram);
     glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
@@ -1428,21 +1796,33 @@ void PreviewWindowRenderer::renderDirectToWindow(const PreviewFrameInfo &frame, 
     glVertexAttribPointer(activePosLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), reinterpret_cast<void *>(0));
     glVertexAttribPointer(activeUvLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), reinterpret_cast<void *>(2 * sizeof(GLfloat)));
 
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(m_currentTextureTarget, m_currentTexture);
-    glUniform1i(activeTexLoc, 0);
+    if (planarTexture) {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, m_planarTextures[0]);
+        glUniform1i(activeYLoc, 0);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, m_planarTextures[1]);
+        glUniform1i(activeULoc, 1);
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, m_planarTextures[2]);
+        glUniform1i(activeVLoc, 2);
+    } else {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(m_currentTextureTarget, m_currentTexture);
+        glUniform1i(activeTexLoc, 0);
+    }
 
     if (!usePassthrough) {
         const float timeSeconds = float(m_shaderTimer.elapsed()) / 1000.0f;
-        glUniform1f(cpuTexture ? m_uTime2DLoc : m_uTimeLoc, timeSeconds);
-        glUniform1i(cpuTexture ? m_uZebraEnabled2DLoc : m_uZebraEnabledLoc, state.zebraEnabled ? 1 : 0);
-        glUniform1f(cpuTexture ? m_uZebraThreshold2DLoc : m_uZebraThresholdLoc, state.zebraThreshold);
-        glUniform1i(cpuTexture ? m_focusPeakingEnabled2DLoc : m_focusPeakingEnabledLoc, state.focusPeakingEnabled ? 1 : 0);
-        glUniform1f(cpuTexture ? m_focusPeakingThreshold2DLoc : m_focusPeakingThresholdLoc, state.focusPeakingThreshold);
-        glUniform1i(cpuTexture ? m_grayscaleEnabled2DLoc : m_grayscaleEnabledLoc, state.grayscaleEnabled ? 1 : 0);
-        glUniform1i(cpuTexture ? m_smpteEnabled2DLoc : m_smpteEnabledLoc, state.smpteEnabled ? 1 : 0);
-        glUniform1i(cpuTexture ? m_falseColorEnabled2DLoc : m_falseColorEnabledLoc, state.falseColorEnabled ? 1 : 0);
-        glUniform1i(cpuTexture ? m_falseColorMode2DLoc : m_falseColorModeLoc, state.falseColorMode);
+        glUniform1f(planarTexture ? m_uTimePlanarLoc : (cpuTexture ? m_uTime2DLoc : m_uTimeLoc), timeSeconds);
+        glUniform1i(planarTexture ? m_uZebraEnabledPlanarLoc : (cpuTexture ? m_uZebraEnabled2DLoc : m_uZebraEnabledLoc), state.zebraEnabled ? 1 : 0);
+        glUniform1f(planarTexture ? m_uZebraThresholdPlanarLoc : (cpuTexture ? m_uZebraThreshold2DLoc : m_uZebraThresholdLoc), state.zebraThreshold);
+        glUniform1i(planarTexture ? m_focusPeakingEnabledPlanarLoc : (cpuTexture ? m_focusPeakingEnabled2DLoc : m_focusPeakingEnabledLoc), state.focusPeakingEnabled ? 1 : 0);
+        glUniform1f(planarTexture ? m_focusPeakingThresholdPlanarLoc : (cpuTexture ? m_focusPeakingThreshold2DLoc : m_focusPeakingThresholdLoc), state.focusPeakingThreshold);
+        glUniform1i(planarTexture ? m_grayscaleEnabledPlanarLoc : (cpuTexture ? m_grayscaleEnabled2DLoc : m_grayscaleEnabledLoc), state.grayscaleEnabled ? 1 : 0);
+        glUniform1i(planarTexture ? m_smpteEnabledPlanarLoc : (cpuTexture ? m_smpteEnabled2DLoc : m_smpteEnabledLoc), state.smpteEnabled ? 1 : 0);
+        glUniform1i(planarTexture ? m_falseColorEnabledPlanarLoc : (cpuTexture ? m_falseColorEnabled2DLoc : m_falseColorEnabledLoc), state.falseColorEnabled ? 1 : 0);
+        glUniform1i(planarTexture ? m_falseColorModePlanarLoc : (cpuTexture ? m_falseColorMode2DLoc : m_falseColorModeLoc), state.falseColorMode);
 
         QVector3D peakColor(1.0f, 0.1f, 0.1f);
         if (state.focusPeakingColor == "Green")
@@ -1453,7 +1833,7 @@ void PreviewWindowRenderer::renderDirectToWindow(const PreviewFrameInfo &frame, 
             peakColor = QVector3D(1.0f, 1.0f, 0.1f);
         else if (state.focusPeakingColor == "Pink")
             peakColor = QVector3D(1.0f, 0.2f, 0.7f);
-        glUniform3f(cpuTexture ? m_focusPeakingColor2DLoc : m_focusPeakingColorLoc,
+        glUniform3f(planarTexture ? m_focusPeakingColorPlanarLoc : (cpuTexture ? m_focusPeakingColor2DLoc : m_focusPeakingColorLoc),
                     peakColor.x(),
                     peakColor.y(),
                     peakColor.z());
@@ -1461,7 +1841,16 @@ void PreviewWindowRenderer::renderDirectToWindow(const PreviewFrameInfo &frame, 
 
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
-    glBindTexture(m_currentTextureTarget, 0);
+    if (planarTexture) {
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    } else {
+        glBindTexture(m_currentTextureTarget, 0);
+    }
     m_previewCacheState = state;
 }
 
@@ -1484,18 +1873,22 @@ void PreviewWindowRenderer::render()
         latestFrame = m_lastRenderableFrame;
     }
 
-    const bool cpuTexture = m_currentTextureTarget == GL_TEXTURE_2D;
-    const bool hasRenderableProgram = cpuTexture
-        ? bool(m_processProgram2D || m_passthroughProgram2D)
-        : bool(m_processProgram || m_passthroughProgram);
+    const bool planarTexture = m_currentTextureIsPlanar;
+    const bool cpuTexture = m_currentTextureTarget == GL_TEXTURE_2D && !planarTexture;
+    const bool hasRenderableProgram = planarTexture
+        ? bool(m_processProgramPlanar || m_passthroughProgramPlanar)
+        : (cpuTexture
+            ? bool(m_processProgram2D || m_passthroughProgram2D)
+            : bool(m_processProgram || m_passthroughProgram));
     if (!m_currentTexture || !latestFrame || !hasRenderableProgram) {
         if (!m_loggedRenderUnavailable) {
             qWarning() << "Apertar preview render unavailable:"
                        << "hasFrame" << bool(latestFrame)
                        << "texture" << m_currentTexture
-                       << "target" << (cpuTexture ? "texture2D" : "external")
+                       << "target" << (planarTexture ? "planarYuv" : (cpuTexture ? "texture2D" : "external"))
                        << "externalPrograms" << bool(m_processProgram || m_passthroughProgram)
-                       << "texture2DPrograms" << bool(m_processProgram2D || m_passthroughProgram2D);
+                       << "texture2DPrograms" << bool(m_processProgram2D || m_passthroughProgram2D)
+                       << "planarPrograms" << bool(m_processProgramPlanar || m_passthroughProgramPlanar);
             m_loggedRenderUnavailable = true;
         }
         m_window->endExternalCommands();
