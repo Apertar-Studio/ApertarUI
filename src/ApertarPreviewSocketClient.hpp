@@ -65,6 +65,7 @@ private:
     QVector<int> takePendingFdsForMessage(const QByteArray &message);
     void setConnected(bool connected);
     void setStatusText(const QString &text);
+    void releaseOwnedPreviewFds();
     void closePreviewFd();
     void closeRegisteredPreviewBuffers();
     void handleMessage(const QByteArray &message, QVector<int> attachedFds);

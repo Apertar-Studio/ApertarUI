@@ -287,7 +287,7 @@ void ApertarPreviewSocketClient::setStatusText(const QString &text)
     emit statusTextChanged();
 }
 
-void ApertarPreviewSocketClient::closePreviewFd()
+void ApertarPreviewSocketClient::releaseOwnedPreviewFds()
 {
     if (m_latestFrame.ownsPlaneFds && m_latestFrame.planeCount > 0) {
         for (int i = 0; i < m_latestFrame.planeCount && i < 3; ++i) {
@@ -295,10 +295,15 @@ void ApertarPreviewSocketClient::closePreviewFd()
                 ::close(m_latestFrame.planeFds[i]);
         }
     } else if (m_previewFd >= 0) {
-            ::close(m_previewFd);
+        ::close(m_previewFd);
     }
 
     m_previewFd = -1;
+}
+
+void ApertarPreviewSocketClient::closePreviewFd()
+{
+    releaseOwnedPreviewFds();
     m_latestFrame = PreviewFrameInfo{};
 }
 
@@ -469,8 +474,6 @@ void ApertarPreviewSocketClient::handlePreviewFrame(const QByteArray &message, Q
         if (it == m_registeredPreviewBuffers.end() || it->second.fd < 0)
             return;
 
-        closePreviewFd();
-
         PreviewFrameInfo frame;
         frame.procid = kOwnedFdProcId;
         frame.slotIndex = slot;
@@ -489,6 +492,7 @@ void ApertarPreviewSocketClient::handlePreviewFrame(const QByteArray &message, Q
             frame.planeOffsets[i] = it->second.planeOffsets[i];
             frame.planePitches[i] = it->second.planePitches[i];
         }
+        releaseOwnedPreviewFds();
         m_latestFrame = frame;
         m_lastFrame = frame.frame;
         if (!m_loggedPreviewFrame) {
@@ -530,12 +534,9 @@ void ApertarPreviewSocketClient::handlePreviewFrame(const QByteArray &message, Q
         return;
     }
 
-    closePreviewFd();
-    m_previewFd = attachedFds.front();
-
     PreviewFrameInfo frame;
     frame.procid = kOwnedFdProcId;
-    frame.fdIsp = m_previewFd;
+    frame.fdIsp = attachedFds.front();
     frame.slotIndex = static_cast<unsigned int>(qMax<qlonglong>(0, slotIndex));
     frame.planeCount = static_cast<int>(planeCount);
     frame.ownsPlaneFds = true;
@@ -562,6 +563,8 @@ void ApertarPreviewSocketClient::handlePreviewFrame(const QByteArray &message, Q
     }
     attachedFds.clear();
 
+    releaseOwnedPreviewFds();
+    m_previewFd = frame.fdIsp;
     m_latestFrame = frame;
     m_lastFrame = frame.frame;
     if (!m_loggedPreviewFrame) {

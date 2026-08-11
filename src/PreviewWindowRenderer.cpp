@@ -640,6 +640,7 @@ void PreviewWindowRenderer::cleanupImportedBuffers()
     m_importedCaptureHeight = 0;
     m_lastImportedSequence = 0;
     m_haveImportedSequence = false;
+    m_lastRenderableFrame.reset();
 }
 
 bool PreviewWindowRenderer::uploadCpuFallbackTexture(const PreviewFrameInfo &frame,
@@ -1475,8 +1476,13 @@ void PreviewWindowRenderer::render()
     initialize();
 
     std::optional<PreviewFrameInfo> latestFrame = currentPreviewFrameFromBridge();
-    if (latestFrame)
+    if (latestFrame) {
         ensureImported(*latestFrame);
+        if (m_currentTexture)
+            m_lastRenderableFrame = latestFrame;
+    } else if (m_currentTexture && m_lastRenderableFrame) {
+        latestFrame = m_lastRenderableFrame;
+    }
 
     const bool cpuTexture = m_currentTextureTarget == GL_TEXTURE_2D;
     const bool hasRenderableProgram = cpuTexture

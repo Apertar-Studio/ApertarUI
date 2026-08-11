@@ -174,6 +174,7 @@ private:
     unsigned int m_lastImportedSequence = 0;
     bool m_haveImportedSequence = false;
     std::optional<PreviewCacheState> m_previewCacheState;
+    std::optional<PreviewFrameInfo> m_lastRenderableFrame;
     bool m_updatePending = false;
     bool m_directWindowRendering = false;
     bool m_forceCpuFallback = false;
